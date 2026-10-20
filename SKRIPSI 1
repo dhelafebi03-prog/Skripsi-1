@@ -1,0 +1,321 @@
+
+
+library(glmmTMB)
+library(DHARMa)
+library(pscl)
+library(dplyr)
+
+# ----------------------------------------------------------
+# 0. PENGATURAN
+# ----------------------------------------------------------
+setwd("C:/Users/ASUS/Downloads/DATA")
+getwd()
+
+berkas_koordinat <- "koordinat_kabupaten.csv"  
+dir.create("hasil", showWarnings = FALSE)
+
+tulis <- function(x, nama, row.names = FALSE) {
+  x <- as.data.frame(x)
+  x[] <- lapply(x, function(v) if (is.numeric(v)) round(v, 4) else v)
+  write.csv2(x, file.path("hasil", nama), row.names = row.names)
+}
+# p-value dalam teks: nilai sangat kecil ditulis "<0,0001" (bukan 0 atau 3e-04)
+fmt_p <- function(p) ifelse(p < 0.0001, "<0,0001",
+                            formatC(p, format = "f", digits = 4, decimal.mark = ","))
+
+# ----------------------------------------------------------
+# 1. PERSIAPAN DATA
+# ----------------------------------------------------------
+dat <- read.csv("Data Cuaca Ekstrem.csv", stringsAsFactors = FALSE) %>%
+  mutate(
+    kode_kabupaten = sprintf("%.2f", kode_kabupaten),   
+    kabupaten = factor(kabupaten),
+    tahun     = factor(tahun),
+    periode   = factor(periode),
+    y         = jumlah_kejadian,
+    hujan_c   = (curah_hujan - mean(curah_hujan)) / 100,  # per 100 mm
+    suhu_c    = suhu - mean(suhu),                         # per 1 C
+    angin_c   = kec_angin - mean(kec_angin),               # per 1 m/s
+    musim     = case_when(
+      bulan %in% c(11, 12, 1, 2, 3) ~ "Hujan",
+      bulan %in% c(4, 5, 10)        ~ "Peralihan",
+      TRUE                          ~ "Kemarau"
+    ),
+    musim = factor(musim, levels = c("Kemarau", "Peralihan", "Hujan"))
+  )
+
+# Pemeriksaan data: berhenti jika ada yang janggal
+stopifnot(nrow(dat) == 1260, sum(dat$y) == 364, !anyNA(dat[, c("y", "curah_hujan", "suhu", "kec_angin")]))
+
+sig <- dat %>%
+  arrange(kabupaten, t) %>%
+  group_by(kabupaten) %>%
+  summarise(sig = paste(suhu, kec_angin, collapse = "|"), .groups = "drop")
+sig$grid <- factor(as.integer(factor(sig$sig)))
+dat <- left_join(dat, sig[, c("kabupaten", "grid")], by = "kabupaten")
+cat("\nKabupaten/kota :", nlevels(dat$kabupaten),
+    "\nSel grid unik  :", nlevels(dat$grid), "\n")
+tulis(sig[, c("kabupaten", "grid")], "grid_cuaca_per_kabupaten.csv")
+
+# Kabupaten/kota tanpa satu pun catatan kejadian
+kab_nol <- dat %>% group_by(kabupaten) %>% summarise(total = sum(y), .groups = "drop") %>%
+  filter(total == 0) %>% pull(kabupaten) %>% as.character()
+cat("Tanpa catatan  :", paste(kab_nol, collapse = ", "), "\n")
+
+f_dasar   <- y ~ hujan_c + suhu_c + angin_c + tahun
+var_cuaca <- c("hujan_c", "suhu_c", "angin_c")
+
+# ----------------------------------------------------------
+# 2. MODEL (semua glmmTMB agar AIC sebanding)
+# ----------------------------------------------------------
+M1 <- glmmTMB(f_dasar, family = poisson, data = dat)    # Poisson
+M2 <- glmmTMB(f_dasar, family = nbinom2, data = dat)    # Binomial Negatif
+M3 <- glmmTMB(update(f_dasar, . ~ . + (1 | kabupaten)),
+              family = poisson, data = dat)             # Poisson + wilayah
+M4 <- glmmTMB(update(f_dasar, . ~ . + (1 | kabupaten)),
+              family = nbinom2, data = dat)             # NB + wilayah
+M5 <- glmmTMB(update(f_dasar, . ~ . + musim + (1 | kabupaten)),
+              family = nbinom2, data = dat)             # M4 + musim (tetap)
+
+# Efek acak periode: guncangan bersama pada bulan-tahun tertentu
+M6 <- glmmTMB(update(f_dasar, . ~ . + (1 | kabupaten) + (1 | periode)),
+              family = nbinom2, data = dat)
+M7 <- glmmTMB(update(f_dasar, . ~ . + musim + (1 | kabupaten) + (1 | periode)),
+              family = nbinom2, data = dat)
+
+# Zero-inflated DENGAN efek wilayah (peluang nol struktural dibuat konstan)
+M8 <- glmmTMB(update(f_dasar, . ~ . + (1 | kabupaten)),
+              ziformula = ~ 1, family = poisson, data = dat)
+M9 <- glmmTMB(update(f_dasar, . ~ . + (1 | kabupaten)),
+              ziformula = ~ 1, family = nbinom2, data = dat)
+
+# Sensitivitas sel grid: efek acak tambahan untuk sel grid NASA POWER
+M10 <- tryCatch(
+  glmmTMB(update(f_dasar, . ~ . + musim + (1 | kabupaten) + (1 | grid)),
+          family = nbinom2, data = dat),
+  error = function(e) { message("M10 (efek acak grid) gagal: ", conditionMessage(e)); NULL })
+
+# Pembanding tanpa efek wilayah (rujukan saja)
+fz   <- y ~ hujan_c + suhu_c + angin_c + tahun | hujan_c + suhu_c + angin_c + tahun
+ZIP  <- zeroinfl(fz, data = dat, dist = "poisson")
+ZINB <- zeroinfl(fz, data = dat, dist = "negbin")
+HP   <- hurdle(fz, data = dat, dist = "poisson", zero.dist = "binomial")
+HNB  <- hurdle(fz, data = dat, dist = "negbin",  zero.dist = "binomial")
+
+# ----------------------------------------------------------
+# 3. TABEL PERBANDINGAN MODEL
+# ----------------------------------------------------------
+semua <- list(
+  "Poisson"                          = M1,
+  "Binomial Negatif"                 = M2,
+  "Poisson + efek wilayah"           = M3,
+  "NB + efek wilayah"                = M4,
+  "NB + efek wilayah + musim"        = M5,
+  "NB + wilayah + periode"           = M6,
+  "NB + wilayah + periode + musim"   = M7,
+  "ZIP + efek wilayah"               = M8,
+  "ZINB + efek wilayah"              = M9,
+  "NB + wilayah + grid + musim"      = M10,
+  "ZIP (tanpa efek wilayah)"         = ZIP,
+  "ZINB (tanpa efek wilayah)"        = ZINB,
+  "Hurdle Poisson (tanpa efek wil.)" = HP,
+  "Hurdle NB (tanpa efek wil.)"      = HNB
+)
+semua <- semua[!sapply(semua, is.null)]
+tabel <- data.frame(
+  Model = names(semua),
+  Param = sapply(semua, function(m) attr(logLik(m), "df")),
+  AIC   = sapply(semua, AIC),
+  BIC   = sapply(semua, BIC),
+  Konvergen = sapply(semua, function(m)
+    if (inherits(m, "glmmTMB")) isTRUE(m$sdr$pdHess) else NA)
+)
+tabel$dAIC <- round(tabel$AIC - min(tabel$AIC), 1)
+tabel$dBIC <- round(tabel$BIC - min(tabel$BIC), 1)
+tabel <- tabel[order(tabel$AIC), ]; rownames(tabel) <- NULL
+cat("\n===== PERBANDINGAN MODEL (kecil = baik) =====\n"); print(tabel)
+tulis(tabel, "perbandingan_model.csv")
+
+# Uji rasio kemungkinan model bersarang
+cat("\n===== LRT: M4 vs M5 (musim) =====\n");            print(anova(M4, M5))
+cat("\n===== LRT: M4 vs M6 (efek acak periode) =====\n"); print(anova(M4, M6))
+cat("\n===== LRT: M6 vs M7 (musim, di atas periode) =====\n"); print(anova(M6, M7))
+cat("(Pengujian ragam efek acak berada di batas ruang parameter; p-value LRT\n",
+    "cenderung konservatif. Andalkan AIC/BIC bersama LRT.)\n")
+
+# ----------------------------------------------------------
+# 4. UJI DISPERSI & NOL BERLEBIH (DHARMa)
+# ----------------------------------------------------------
+cek <- function(m, nama) {
+  hit <- function(...) {
+    s <- simulateResiduals(m, n = 500, seed = 123, ...)
+    c(testDispersion(s, plot = FALSE)$p.value,
+      testZeroInflation(s, plot = FALSE)$p.value)
+  }
+  kond <- hit()
+  lama <- tryCatch(hit(simulateREs = "user-specified"), error = function(e) c(NA, NA))
+  data.frame(Model = nama, p_dispersi_kond = kond[1], p_nol_kond = kond[2],
+             p_dispersi_lama = lama[1], p_nol_lama = lama[2])
+}
+cek_tab <- rbind(
+  cek(M1, "Poisson"), cek(M2, "Binomial Negatif"),
+  cek(M3, "Poisson + efek wilayah"), cek(M4, "NB + efek wilayah"),
+  cek(M5, "NB + efek wilayah + musim"), cek(M6, "NB + wilayah + periode"),
+  cek(M7, "NB + wilayah + periode + musim"), cek(M9, "ZINB + efek wilayah")
+)
+identik <- all(abs(cek_tab$p_dispersi_kond - cek_tab$p_dispersi_lama) < 1e-6, na.rm = TRUE) &&
+  all(abs(cek_tab$p_nol_kond - cek_tab$p_nol_lama) < 1e-6, na.rm = TRUE)
+if (identik) {
+  message("Kolom 'lama' identik dengan 'kond' -> dibuang (argumen tidak berpengaruh).")
+  cek_tab <- cek_tab[, c("Model", "p_dispersi_kond", "p_nol_kond")]
+}
+cat("\n===== UJI DISPERSI & NOL =====\n"); print(cek_tab)
+tulis(cek_tab, "uji_dispersi.csv")
+
+# ----------------------------------------------------------
+# 5. PILIH MODEL AKHIR
+# ----------------------------------------------------------
+#   "M5" : NB + wilayah + musim (paling sederhana untuk dijelaskan)
+#   "M6" : NB + wilayah + periode (AIC dan BIC terbaik, diagnostik lengkap)
+#   "M7" : NB + wilayah + periode + musim
+model_utama <- "M5"
+M_akhir <- get(model_utama)
+
+cat("\n===== RINGKASAN MODEL AKHIR (", model_utama, ") =====\n", sep = "")
+print(summary(M_akhir))
+
+# ----------------------------------------------------------
+# 6. IRR + SELANG KEPERCAYAAN
+# ----------------------------------------------------------
+irr <- function(m) {
+  s <- summary(m)$coefficients$cond
+  data.frame(Variabel = rownames(s),
+             IRR   = exp(s[, 1]),
+             Bawah = exp(s[, 1] - 1.96 * s[, 2]),
+             Atas  = exp(s[, 1] + 1.96 * s[, 2]),
+             p     = s[, 4], row.names = NULL)
+}
+tampil <- function(r) transform(r, IRR = round(IRR, 3), Bawah = round(Bawah, 3),
+                                Atas = round(Atas, 3), p = fmt_p(p))
+tab_irr <- irr(M_akhir)
+cat("\n===== IRR MODEL AKHIR =====\n")
+cat("hujan_c: per +100 mm | suhu_c: per +1 C | angin_c: per +1 m/s\n")
+print(tampil(tab_irr), row.names = FALSE)
+tulis(transform(tab_irr, p_teks = fmt_p(p)), "irr_model_akhir.csv")
+
+banding <- do.call(rbind, Map(function(m, n) {
+  r <- irr(m); cbind(Model = n, r[r$Variabel %in% var_cuaca, ])
+}, list(M4, M5, M6, M7),
+c("M4", "M5 (+musim)", "M6 (+periode)", "M7 (+musim+periode)")))
+cat("\n===== IRR VARIABEL CUACA ANTAR MODEL =====\n")
+print(tampil(banding), row.names = FALSE)
+tulis(transform(banding, p_teks = fmt_p(p)), "banding_irr_antar_model.csv")
+
+# Efek acak
+cat("\nSimpangan baku efek acak:\n"); print(VarCorr(M_akhir))
+writeLines(capture.output(print(VarCorr(M_akhir))), "hasil/varcorr_model_akhir.txt")
+
+re <- ranef(M_akhir)$cond$kabupaten
+re <- data.frame(kabupaten = rownames(re), efek = re[, 1])
+re$tanpa_catatan <- re$kabupaten %in% kab_nol
+re <- re[order(-re$efek), ]
+cat("\n5 kabupaten tertinggi (cuaca dikontrol):\n"); print(head(re, 5), row.names = FALSE)
+cat("\n5 kabupaten terendah:\n");                     print(tail(re, 5), row.names = FALSE)
+cat("(tanpa_catatan = TRUE: tidak ada catatan DIBI; tafsirkan 'tidak tercatat', bukan 'rendah'.)\n")
+tulis(re, "efek_acak_kabupaten.csv")
+
+# Efek acak periode (jika model akhir memuatnya): bulan mana yang "guncangan"-nya tinggi
+rp <- ranef(M_akhir)$cond$periode
+if (!is.null(rp)) {
+  rp <- data.frame(periode = rownames(rp), efek = rp[, 1]); rp <- rp[order(-rp$efek), ]
+  cat("\nBulan dengan guncangan bersama tertinggi:\n"); print(head(rp, 5), row.names = FALSE)
+  tulis(rp, "efek_acak_periode.csv")
+}
+
+# ----------------------------------------------------------
+# 7. FREKUENSI OBSERVASI vs PREDIKSI
+# ----------------------------------------------------------
+frek <- function(m, tipe) {
+  mu <- fitted(m)
+  P <- sapply(0:4, function(k)
+    if (tipe == "pois") sum(dpois(k, mu)) else sum(dnbinom(k, size = sigma(m), mu = mu)))
+  c(P, nrow(dat) - sum(P))
+}
+obs <- c(sapply(0:4, function(k) sum(dat$y == k)), sum(dat$y >= 5))
+fp <- rbind(Observasi = obs,
+            Poisson = frek(M1, "pois"), NB = frek(M2, "nb"),
+            Poisson_wilayah = frek(M3, "pois"), NB_wilayah = frek(M4, "nb"),
+            NB_wilayah_musim = frek(M5, "nb"), NB_wilayah_periode = frek(M6, "nb"),
+            NB_wilayah_periode_musim = frek(M7, "nb"))
+colnames(fp) <- c("0", "1", "2", "3", "4", "5+")
+cat("\n===== FREKUENSI OBSERVASI vs PREDIKSI =====\n"); print(round(fp, 1))
+tulis(round(fp, 1), "frekuensi_obs_vs_prediksi.csv", row.names = TRUE)
+
+# ----------------------------------------------------------
+# 8. DIAGNOSTIK RESIDUAL (model akhir; PNG)
+# ----------------------------------------------------------
+sim_akhir <- simulateResiduals(M_akhir, n = 500, seed = 123)
+png("hasil/diagnostik_residual.png", width = 2000, height = 1000, res = 200)
+plot(sim_akhir); dev.off()
+
+# Autokorelasi waktu: residual dijumlahkan per bulan (36 titik) sehingga dayanya
+# terbatas. p > 0,05 = tidak ditemukan bukti autokorelasi (bukan bukti tidak ada).
+sim_t <- recalculateResiduals(sim_akhir, group = dat$t)
+png("hasil/diagnostik_waktu.png", width = 2000, height = 1000, res = 200)
+uji_t <- testTemporalAutocorrelation(sim_t, time = sort(unique(dat$t))); dev.off()
+cat("\n===== AUTOKORELASI WAKTU =====\n"); print(uji_t)
+
+# ----------------------------------------------------------
+# 9. AUTOKORELASI SPASIAL (opsional; butuh koordinat_kabupaten.csv: kabupaten, lon, lat)
+# ----------------------------------------------------------
+if (file.exists(berkas_koordinat)) {
+  koord <- read.csv(berkas_koordinat, stringsAsFactors = FALSE)
+  koord <- koord[match(levels(dat$kabupaten), koord$kabupaten), ]
+  if (anyNA(koord$lon) || anyNA(koord$lat)) {
+    message("Ada kabupaten tanpa koordinat; uji spasial dilewati.")
+  } else {
+    sim_s <- recalculateResiduals(sim_akhir, group = dat$kabupaten)
+    cat("\n===== AUTOKORELASI SPASIAL =====\n")
+    print(testSpatialAutocorrelation(sim_s, x = koord$lon, y = koord$lat))
+  }
+} else message("File koordinat tidak ditemukan; uji spasial dilewati.")
+
+# ----------------------------------------------------------
+# 10. UJI KEKOKOHAN (M4-M7 pada 4 skenario)
+# ----------------------------------------------------------
+rob_fun <- function(m, label) {
+  fm <- formula(m); fam <- family(m)
+  skenario <- list(
+    "Semua data" = dat,
+    "Tanpa Jepara Feb 2023" =
+      droplevels(subset(dat, !(kabupaten == "Jepara" & tahun == "2023" & bulan == 2))),
+    "Hanya 2024-2025" = droplevels(subset(dat, tahun %in% c("2024", "2025"))),
+    "Tanpa wilayah tanpa catatan" = droplevels(subset(dat, !(kabupaten %in% kab_nol)))
+  )
+  do.call(rbind, lapply(names(skenario), function(n) {
+    mm <- tryCatch(glmmTMB(fm, family = fam, data = skenario[[n]]),
+                   error = function(e) NULL)
+    if (is.null(mm)) return(NULL)
+    r <- irr(mm); r <- r[r$Variabel %in% var_cuaca, ]
+    cbind(Model = label, Skenario = n, r)
+  }))
+}
+rob <- rbind(rob_fun(M4, "M4"), rob_fun(M5, "M5 (+musim)"),
+             rob_fun(M6, "M6 (+periode)"), rob_fun(M7, "M7 (+musim+periode)"))
+cat("\n===== KEKOKOHAN HASIL =====\n"); print(tampil(rob), row.names = FALSE)
+tulis(transform(rob, p_teks = fmt_p(p)), "kekokohan.csv")
+
+# ----------------------------------------------------------
+# 11. INFORMASI PENDUKUNG DAN RIWAYAT SESI
+# ----------------------------------------------------------
+cat("\nRata-rata cuaca per musim:\n")
+print(aggregate(cbind(curah_hujan, suhu, kec_angin) ~ musim, dat, mean))
+cat("\nRata-rata kejadian per musim:\n"); print(aggregate(y ~ musim, dat, mean))
+cat("\nKorelasi antar prediktor:\n"); print(round(cor(dat[, var_cuaca]), 3))
+
+writeLines(capture.output(sessionInfo()), "hasil/sessionInfo.txt")
+writeLines(capture.output({
+  print(summary(M_akhir)); cat("\n"); print(anova(M4, M5)); print(anova(M4, M6))
+}), "hasil/ringkasan_model_akhir.txt")
+cat("\nSelesai. Semua tabel dan grafik ada di folder 'hasil/'.\n")
+
